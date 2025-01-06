@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -186,17 +188,10 @@ func (r *ramPolicyResource) Read(ctx context.Context, req resource.ReadRequest, 
 		return
 	}
 
-	// This state will be using to compare with the current state.
-	var oriState *ramPolicyResourceModel
-	getOriStateDiags := req.State.Get(ctx, &oriState)
-	resp.Diagnostics.Append(getOriStateDiags...)
+	comparePolicyDiags := r.comparePolicy(state)
+	resp.Diagnostics.Append(comparePolicyDiags...)
 	if resp.Diagnostics.HasError() {
 		return
-	}
-
-	if len(state.Policies.Elements()) != len(oriState.Policies.Elements()) {
-		resp.Diagnostics.AddWarning("Combined policies not found.", "The combined policies attached to the user may be deleted due to human mistake or API error.")
-		state.AttachedPolicies = types.ListNull(types.StringType)
 	}
 
 	setStateDiags := resp.State.Set(ctx, &state)
@@ -204,6 +199,133 @@ func (r *ramPolicyResource) Read(ctx context.Context, req resource.ReadRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
+}
+
+/*
+	1. Get Original Combined Policy Document
+		a. Extract Statement
+		b. Split Statement by Comma
+	2. Get Current Policy Document of each Attached Policies
+		a. Extract Statement
+	3. For Each Statement in Combined Policy Document
+		For Each Statement of Attached Policies
+
+		3a. Compare if the statements are equal
+*/
+
+func (r *ramPolicyResource) comparePolicy(state *ramPolicyResourceModel) diag.Diagnostics {
+	// 1. Get Original Combined Policy Document
+	policyDetailsState := []*policyDetail{}
+	policyTypes := []string{"Custom", "System"}
+	//getPolicyResponse := &alicloudRamClient.GetPolicyResponse{}
+
+	getPolicy := func() error {
+		runtime := &util.RuntimeOptions{}
+		data := make(map[string]string)
+
+		for _, policies := range state.Policies.Elements() {
+			json.Unmarshal([]byte(policies.String()), &data)
+
+			// To Get the Combined Policy
+			getPolicyRequest := &alicloudRamClient.GetPolicyRequest{
+				PolicyName: tea.String(data["policy_name"]),
+				PolicyType: tea.String("Custom"),
+			}
+
+			getPolicyResponse, err := r.client.GetPolicyWithOptions(getPolicyRequest, runtime)
+			if err != nil {
+				handleAPIError(err)
+			}
+
+			//Sometimes combined policies may be removed accidentally by human mistake or API error.
+			if getPolicyResponse.Body != nil && getPolicyResponse.Body.Policy != nil {
+				if getPolicyResponse.Body.Policy.PolicyName != nil && getPolicyResponse.Body.DefaultPolicyVersion.PolicyDocument != nil {
+					oriPolicyName := *getPolicyResponse.Body.Policy.PolicyName
+					oriPolicyDoc := *getPolicyResponse.Body.DefaultPolicyVersion.PolicyDocument
+
+					policyDetail := policyDetail{
+						PolicyName:     types.StringValue(oriPolicyName),
+						PolicyDocument: types.StringValue(oriPolicyDoc),
+					}
+					policyDetailsState = append(policyDetailsState, &policyDetail)
+
+					// 1a. Extract Statement
+					var data map[string]interface{}
+					if err := json.Unmarshal([]byte(oriPolicyDoc), &data); err != nil {
+						return err
+					}
+
+					statementArr := data["Statement"].([]interface{})
+					oriStatementBytes, err := json.Marshal(statementArr)
+					if err != nil {
+						return err
+					}
+
+					// 2. Get Current Policy Get Current Policy Document of each Attached Policies
+					for _, currPolicyName := range state.AttachedPolicies.Elements() {
+						for _, policyType := range policyTypes {
+							getPolicyRequest := &alicloudRamClient.GetPolicyRequest{
+								PolicyName: tea.String(currPolicyName.(types.String).ValueString()),
+								PolicyType: tea.String(policyType),
+							}
+
+							getPolicyResponse, err := r.client.GetPolicyWithOptions(getPolicyRequest, &util.RuntimeOptions{})
+							if err != nil {
+								handleAPIError(err)
+								continue
+							}
+
+							// 2a. Extract Statement
+							tempPolicyDocument := *getPolicyResponse.Body.DefaultPolicyVersion.PolicyDocument
+
+							var data map[string]interface{}
+							if err := json.Unmarshal([]byte(tempPolicyDocument), &data); err != nil {
+								return err
+							}
+
+							currStatementArr := data["Statement"].([]interface{})
+							currStatementBytes, err := json.Marshal(currStatementArr)
+							if err != nil {
+								return err
+							}
+
+							combinedOriStatements := strings.Trim(string(oriStatementBytes), "[]")
+							// 1b. Split Statement by Comma
+							output := regexp.MustCompile(`\},\{`).ReplaceAllString(combinedOriStatements, "}{}")
+							oriStatements := regexp.MustCompile(`\}.*?\}`).FindAllString(output, -1)
+							currStatement := strings.Trim(string(currStatementBytes), "[]") //TODO: REGEX PATTERN MATCHING
+
+							for _, oriStatement := range oriStatements {
+
+								log.Printf("xqc: %v xqc: %v", oriStatement, currStatement)
+
+								if string(oriStatement) == string(currStatement) { // 3a. Compare if the statements are equal
+									state.AttachedPolicies = types.ListNull(types.StringType)
+									return nil
+								}
+							}
+						}
+					}
+
+				}
+			}
+		}
+		return nil
+	}
+
+	reconnectBackoff := backoff.NewExponentialBackOff()
+	reconnectBackoff.MaxElapsedTime = 30 * time.Second
+	err := backoff.Retry(getPolicy, reconnectBackoff)
+	if err != nil {
+		return diag.Diagnostics{
+			diag.NewErrorDiagnostic(
+				"[API ERROR] Failed to Read Policy.",
+				err.Error(),
+			),
+		}
+	}
+
+	return nil
 }
 
 func (r *ramPolicyResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -435,12 +557,12 @@ func (r *ramPolicyResource) readPolicy(state *ramPolicyResourceModel) diag.Diagn
 	var err error
 	getPolicy := func() error {
 		runtime := &util.RuntimeOptions{}
-
 		data := make(map[string]string)
 
 		for _, policies := range state.Policies.Elements() {
 			json.Unmarshal([]byte(policies.String()), &data)
 
+			// To Get the Combined Policy
 			getPolicyRequest := &alicloudRamClient.GetPolicyRequest{
 				PolicyName: tea.String(data["policy_name"]),
 				PolicyType: tea.String("Custom"),
@@ -451,7 +573,7 @@ func (r *ramPolicyResource) readPolicy(state *ramPolicyResourceModel) diag.Diagn
 				handleAPIError(err)
 			}
 
-			// Sometimes combined policies may be removed accidentally by human mistake or API error.
+			//Sometimes combined policies may be removed accidentally by human mistake or API error.
 			if getPolicyResponse.Body != nil && getPolicyResponse.Body.Policy != nil {
 				if getPolicyResponse.Body.Policy.PolicyName != nil && getPolicyResponse.Body.DefaultPolicyVersion.PolicyDocument != nil {
 					policyDetail := policyDetail{
@@ -479,6 +601,7 @@ func (r *ramPolicyResource) readPolicy(state *ramPolicyResourceModel) diag.Diagn
 
 	policyDetails := []attr.Value{}
 	for _, policy := range policyDetailsState {
+		log.Printf("Policy of %v is %v", policy.PolicyName, policy.PolicyDocument)
 		policyDetails = append(policyDetails, types.ObjectValueMust(
 			map[string]attr.Type{
 				"policy_name":     types.StringType,
@@ -490,6 +613,7 @@ func (r *ramPolicyResource) readPolicy(state *ramPolicyResourceModel) diag.Diagn
 			},
 		))
 	}
+
 	state.Policies = types.ListValueMust(
 		types.ObjectType{
 			AttrTypes: map[string]attr.Type{
