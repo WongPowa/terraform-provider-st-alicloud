@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -207,6 +206,7 @@ func (r *ramPolicyResource) Read(ctx context.Context, req resource.ReadRequest, 
 		b. Split Statement by Comma
 	2. Get Current Policy Document of each Attached Policies
 		a. Extract Statement
+		b. Split Statement by Comma
 	3. For Each Statement in Combined Policy Document
 		For Each Statement of Attached Policies
 
@@ -217,7 +217,6 @@ func (r *ramPolicyResource) comparePolicy(state *ramPolicyResourceModel) diag.Di
 	// 1. Get Original Combined Policy Document
 	policyDetailsState := []*policyDetail{}
 	policyTypes := []string{"Custom", "System"}
-	//getPolicyResponse := &alicloudRamClient.GetPolicyResponse{}
 
 	getPolicy := func() error {
 		runtime := &util.RuntimeOptions{}
@@ -289,19 +288,22 @@ func (r *ramPolicyResource) comparePolicy(state *ramPolicyResourceModel) diag.Di
 								return err
 							}
 
-							combinedOriStatements := strings.Trim(string(oriStatementBytes), "[]")
 							// 1b. Split Statement by Comma
+							combinedOriStatements := strings.Trim(string(oriStatementBytes), "[]")
 							output := regexp.MustCompile(`\},\{`).ReplaceAllString(combinedOriStatements, "}{}")
-							oriStatements := regexp.MustCompile(`\}.*?\}`).FindAllString(output, -1)
-							currStatement := strings.Trim(string(currStatementBytes), "[]") //TODO: REGEX PATTERN MATCHING
+							oriStatements := regexp.MustCompile(`\{.*?\}`).FindAllString(output, -1)
+
+							// 2b. Split Statement by Comma
+							combinedCurrStatements := strings.Trim(string(currStatementBytes), "[]")
+							output = regexp.MustCompile(`\},\{`).ReplaceAllString(combinedCurrStatements, "}{}")
+							currStatements := regexp.MustCompile(`\{.*?\}`).FindAllString(output, -1)
 
 							for _, oriStatement := range oriStatements {
-
-								log.Printf("xqc: %v xqc: %v", oriStatement, currStatement)
-
-								if string(oriStatement) == string(currStatement) { // 3a. Compare if the statements are equal
-									state.AttachedPolicies = types.ListNull(types.StringType)
-									return nil
+								for _, currStatement := range currStatements {
+									if string(oriStatement) == string(currStatement) { // 3a. Compare if the statements are equal
+										state.AttachedPolicies = types.ListNull(types.StringType)
+										return nil
+									}
 								}
 							}
 						}
@@ -601,7 +603,6 @@ func (r *ramPolicyResource) readPolicy(state *ramPolicyResourceModel) diag.Diagn
 
 	policyDetails := []attr.Value{}
 	for _, policy := range policyDetailsState {
-		log.Printf("Policy of %v is %v", policy.PolicyName, policy.PolicyDocument)
 		policyDetails = append(policyDetails, types.ObjectValueMust(
 			map[string]attr.Type{
 				"policy_name":     types.StringType,
